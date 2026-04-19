@@ -1,19 +1,12 @@
-/*
-s3fs.go file will act as the translator between data (messy, compressed binary)
-coming from AWS to the computer's operating system (using bitwise math operations).
-*/
-
 package main
 
-// Imports
 import (
 	"encoding/binary"
 	"io"
 )
 
-// Constants
 const (
-	S3BUMagic     uint32 = 0x55423353 // hexadecimal representation of "S3BU" needed
+	S3BUMagic     uint32 = 0x55423353 // "S3BU" magic validation number
 	FlagUseInum   uint32 = 2
 	FlagDirLoc    uint32 = 4
 	FlagDirData   uint32 = 8
@@ -21,18 +14,18 @@ const (
 	FlagHardLinks uint32 = 32
 )
 
-// S3Super struct variables (Acts as the backup file's "header")
+// S3Super is the backup file's header
 type S3Super struct {
 	Magic   uint32
-	Version uint32 // superblock version
+	Version uint32
 	Flags   uint32
-	Len     uint32 // how long the superblock is
+	Len     uint32
 	NVers   uint32
 }
 
 func ParseSuperblock(r io.Reader) (*S3Super, error) {
 	var super S3Super
-	// binary.Read will read the binary stream "r", flip their bytes, and map them to the S3Super struct variables
+	// Read C-style little-endian bytes into Go struct
 	err := binary.Read(r, binary.LittleEndian, &super)
 	if err != nil {
 		return nil, err
@@ -40,6 +33,7 @@ func ParseSuperblock(r io.Reader) (*S3Super, error) {
 	return &super, nil
 }
 
+// S3Offset cleanly separates Sector and Object ID
 type S3Offset struct {
 	Sector uint64
 	Object uint16
@@ -47,24 +41,20 @@ type S3Offset struct {
 
 func ParseS3Offset(raw uint64) S3Offset {
 	return S3Offset{
-		// We use a bitmask (twelve 'F's = 48 binary 1s) as a filter.
-		// It keeps the bottom 48 bits (the Sector) and wipes the top 16 bits clean.
-		Sector: raw & 0xFFFFFFFFFFFF,
-		// We slide all the bits 48 spaces to the right. This pushes the sector data off a cliff,
-		// leaving only the 16-bit Object ID.
-		Object: uint16(raw >> 48),
+		Sector: raw & 0xFFFFFFFFFFFF, // Mask: Keep bottom 48 bits
+		Object: uint16(raw >> 48),    // Shift: Keep top 16 bits
 	}
 }
 
-// S3DirEnt represents a single file or folder entry in the backup
+// S3DirEnt holds unpacked file metadata
 type S3DirEnt struct {
 	Mode    uint16
 	UID     uint16
 	GID     uint16
 	CTime   uint32
 	Off     S3Offset
-	Bytes   uint64 // The unpacked 52-bit file size
-	Xattr   uint16 // The unpacked 12-bit extended attributes
+	Bytes   uint64 // Unpacked 52-bit size
+	Xattr   uint16 // Unpacked 12-bit attributes
 	NameLen uint8
 	Name    string
 }
@@ -72,7 +62,7 @@ type S3DirEnt struct {
 func ParseDirEnt(r io.Reader) (*S3DirEnt, error) {
 	var ent S3DirEnt
 
-	// Read the standard, fixed-size numbers one by one out of the binary stream.
+	// Read standard fixed-size fields
 	if err := binary.Read(r, binary.LittleEndian, &ent.Mode); err != nil {
 		return nil, err
 	}
@@ -80,30 +70,25 @@ func ParseDirEnt(r io.Reader) (*S3DirEnt, error) {
 	binary.Read(r, binary.LittleEndian, &ent.GID)
 	binary.Read(r, binary.LittleEndian, &ent.CTime)
 
-	// Read the raw 64-bit chunk containing the offset, then hand it to our math function to split it up.
+	// Read and split 64-bit Offset chunk
 	var rawOffset uint64
 	binary.Read(r, binary.LittleEndian, &rawOffset)
 	ent.Off = ParseS3Offset(rawOffset)
 
-	// Read the next 64-bit chunk containing the squished File Size and Attributes.
+	// Read and split 64-bit Size/Attribute chunk
 	var rawBytesXattr uint64
 	binary.Read(r, binary.LittleEndian, &rawBytesXattr)
+	ent.Bytes = rawBytesXattr & 0xFFFFFFFFFFFFF // Mask: Keep bottom 52 bits
+	ent.Xattr = uint16(rawBytesXattr >> 52)     // Shift: Keep top 12 bits
 
-	// Thirteen 'F's equals fifty-two 1s. This mask isolates the exact 52-bit file size.
-	ent.Bytes = rawBytesXattr & 0xFFFFFFFFFFFFF
-	// Slide the data 52 spaces to the right, leaving only the 12-bit attribute data.
-	ent.Xattr = uint16(rawBytesXattr >> 52)
-
-	// Filenames change in length, so we have to read the length first.
+	// Read variable-length filename
 	binary.Read(r, binary.LittleEndian, &ent.NameLen)
+	nameBytes := make([]byte, ent.NameLen) // Allocate exact space
 
-	// Create a blank byte array of exactly that size, read exactly that many letters
-	// from the stream, and convert those raw bytes into a readable Go string.
-	nameBytes := make([]byte, ent.NameLen)
 	if _, err := io.ReadFull(r, nameBytes); err != nil {
 		return nil, err
 	}
-	ent.Name = string(nameBytes)
+	ent.Name = string(nameBytes) // Convert bytes to string
 
 	return &ent, nil
 }
